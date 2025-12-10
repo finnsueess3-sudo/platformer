@@ -1,71 +1,349 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="de">
 <head>
-<meta charset="utf-8">
-<title>2D Fighter Multiplayer Demo</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Web Platform Fighter — Demo</title>
 <style>
-  body { margin:0; background:#111; color:white; font-family:Arial; }
-  canvas { display:block; margin:20px auto; background:#1e1e1e; border:2px solid #333; }
+  :root { --bg:#0f1226; --panel:#121325; --accent:#4ad; --enemy:#fa6; --ui:#ddd }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ui);font-family:Inter,Arial}
+  #container{max-width:1000px;margin:14px auto;text-align:center}
+  canvas{display:block;margin:10px auto;border:3px solid #222;background:linear-gradient(#081021,#091226)}
+  #hud{display:flex;justify-content:space-between;align-items:center;padding:6px 12px}
+  .hint{opacity:.85}
+  .controls{font-size:13px;opacity:.9}
+  .status{font-size:13px}
 </style>
 </head>
 <body>
-
-<canvas id="game" width="800" height="450"></canvas>
+<div id="container">
+  <div id="hud">
+    <div class="hint">WASD/Arrows = Bewegung, W/↑ = Sprung, J = Dash, K = Schuss, L = Ultimate (halten)</div>
+    <div class="controls">Server: <span id="serverUrl">ws://localhost:8080</span></div>
+  </div>
+  <canvas id="game" width="1000" height="520"></canvas>
+  <div style="color:#ccc;font-size:13px;margin-top:6px">Öffne mehrere Tabs für Multiplayer-Test.</div>
+</div>
 
 <script>
-const canvas = document.getElementById("game");
-const ctx = canvas.getContext("2d");
+/* -----------------------------
+   Konfiguration
+   ----------------------------- */
+const SERVER_URL = 'ws://localhost:8080';
+const CLIENT_TICK_RATE = 60;      // local sim tick (Hz)
+const SERVER_SNAPSHOT_RATE = 20;  // erwartete server snapshots /s
+const MAX_INTERP_MS = 200;        // wie weit remote interpolation erlaubt wird
 
-const ws = new WebSocket("ws://localhost:8080");
-let playerId = null;
-let players = {};
+/* -----------------------------
+   WebSocket & Networking
+   ----------------------------- */
+let ws = null;
+let myId = null;
+let latestServerTick = 0;
+let serverSnapshots = []; // keeps recent snapshots for interpolation
 
-ws.onmessage = (msg) => {
-    const data = JSON.parse(msg.data);
+function connect() {
+  ws = new WebSocket(SERVER_URL);
+  ws.onopen = () => console.log('WS connected');
+  ws.onmessage = (m) => handleServerMessage(JSON.parse(m.data));
+  ws.onclose = () => { console.log('WS closed, reconnecting...'); setTimeout(connect,1000); };
+}
+connect();
 
-    if (data.type === "init") {
-        playerId = data.id;
-    }
+function sendInputPacket(pkt) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(pkt));
+}
 
-    if (data.type === "state") {
-        players = data.players;
-    }
-};
+/* -----------------------------
+   Canvas, Input
+   ----------------------------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
 
 let keys = {};
-document.addEventListener("keydown", e => keys[e.key.toLowerCase()] = true);
-document.addEventListener("keyup", e => keys[e.key.toLowerCase()] = false);
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if(e.key===' ') e.preventDefault(); });
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
-function sendInput() {
-    if (!playerId) return;
-    ws.send(JSON.stringify({
-        type:"input",
-        left: keys["a"],
-        right: keys["d"],
-        jump: keys["w"]
-    }));
+/* -----------------------------
+   Game State (client-side copy)
+   ----------------------------- */
+let localTick = 0;
+let pendingInputs = []; // inputs applied locally but pending server confirmation
+let players = {};       // client-side authoritative-resolved positions for rendering
+let projectiles = {};   // rendered projectiles (from snapshots)
+
+/* -----------------------------
+   Default Entities
+   ----------------------------- */
+function defaultPlayerState(id) {
+  return {
+    id, x:100, y:300, vx:0, vy:0, w:36, h:56, grounded:false, facing:1, hp:100,
+    dashCooldown:0, ultCharge:0
+  };
 }
 
-function draw() {
-    ctx.clearRect(0,0,800,450);
+/* -----------------------------
+   Input collection & client prediction
+   ----------------------------- */
+function collectInput() {
+  return {
+    tick: localTick,
+    ts: Date.now(),
+    left: keys['a'] || keys['arrowleft'],
+    right: keys['d'] || keys['arrowright'],
+    jump: keys['w'] || keys['arrowup'],
+    dash: keys['j'],        // momentary
+    shoot: keys['k'],       // momentary
+    ultHold: keys['l']      // hold for charge
+  };
+}
 
-    // Draw ground
-    ctx.fillStyle = "#333";
-    ctx.fillRect(0, 380, 800, 70);
+/* -----------------------------
+   Physics + apply input to a player state
+   (same-ish rules client and server, but server is authoritative)
+   ----------------------------- */
+function applyInputToPlayer(p, input, dt, serverSide=false) {
+  // params
+  const SPEED = 240;     // px/s
+  const GRAV = 1500;
+  const JUMP_V = -430;
+  const DASH_V = 520;
+  const FRICTION = 0.9;
 
-    // Draw players
-    for (let id in players) {
-        const p = players[id];
-        ctx.fillStyle = id === playerId ? "#4af" : "#fa4";
-        ctx.fillRect(p.x, p.y, 40, 60);
+  // horizontal movement
+  let ax = 0;
+  if (input.left) ax -= 1;
+  if (input.right) ax += 1;
+  p.vx = ax * SPEED;
+
+  if (ax !== 0) p.facing = ax > 0 ? 1 : -1;
+
+  // dash (server enforces cooldown; client will predict)
+  if (input.dash && (!p._dashing)) {
+    // mark predicted dash (client)
+    p._dashing = true;
+    p._dashTimer = 0.12; // seconds
+    p.vx = p.facing * DASH_V;
+  }
+  if (p._dashing) {
+    p._dashTimer -= dt;
+    if (p._dashTimer <= 0) { p._dashing = false; p._dashTimer = 0; }
+  }
+
+  // gravity + vertical
+  p.vy += GRAV * dt;
+
+  // jump: only when grounded
+  if (input.jump && p.grounded) {
+    p.vy = JUMP_V;
+    p.grounded = false;
+  }
+
+  // integrate
+  p.x += p.vx * dt;
+  p.y += p.vy * dt;
+
+  // ground/platform collision - simple: ground at y=420 plus platforms (client predicts)
+  // ground
+  if (p.y > 420 - p.h) {
+    p.y = 420 - p.h;
+    p.vy = 0;
+    p.grounded = true;
+  }
+
+  // small friction when grounded
+  if (p.grounded) p.vx *= FRICTION;
+
+  // clamp positions (simple bounds)
+  if (p.x < 8) p.x = 8;
+  if (p.x > canvas.width - p.w - 8) p.x = canvas.width - p.w - 8;
+}
+
+/* -----------------------------
+   Client main tick (prediction)
+   ----------------------------- */
+const CLIENT_DT = 1 / CLIENT_TICK_RATE;
+function clientTick() {
+  const input = collectInput();
+  pendingInputs.push(input);
+
+  // send input to server (can also aggregate)
+  sendInputPacket({type:'input', input});
+
+  // ensure local player exists
+  if (!myId) {
+    // still waiting for server welcome
+    localTick++;
+    return;
+  }
+  if (!players[myId]) players[myId] = defaultPlayerState(myId);
+
+  // apply input locally for prediction
+  applyInputToPlayer(players[myId], input, CLIENT_DT, false);
+
+  localTick++;
+}
+
+/* -----------------------------
+   Reconciliation on server snapshot
+   ----------------------------- */
+function handleServerMessage(msg) {
+  if (msg.type === 'welcome') {
+    myId = msg.id;
+    console.log('welcome id=', myId);
+  } else if (msg.type === 'snapshot') {
+    latestServerTick = msg.tick;
+    // store snapshot for interpolation
+    serverSnapshots.push(msg);
+    // keep only recent snapshots up to a limit
+    while (serverSnapshots.length > 10) serverSnapshots.shift();
+
+    // immediate authoritative reconciliation for local player:
+    const authoritative = msg.players.find(p=>p.id === myId);
+    if (authoritative) {
+      // set authoritative state client-side then reapply pending inputs after snap.tick
+      players[myId] = Object.assign({}, authoritative);
+      // reapply pending inputs with tick > msg.tick
+      pendingInputs = pendingInputs.filter(inp=> {
+        if (inp.tick <= msg.tick) return false;
+        // reapply
+        applyInputToPlayer(players[myId], inp, CLIENT_DT, false);
+        return true;
+      });
     }
+
+    // update all other players and projectiles from snapshot (but use interpolation when rendering)
+    projectiles = {};
+    msg.players.forEach(p => {
+      players[p.id] = Object.assign({}, players[p.id] || defaultPlayerState(p.id), p);
+    });
+    (msg.projectiles||[]).forEach(proj => {
+      projectiles[proj.id] = proj;
+    });
+  } else if (msg.type === 'chat') {
+    console.log('chat:', msg.text);
+  }
 }
 
-setInterval(() => {
-    sendInput();
-    draw();
-}, 1000/60);
-</script>
+/* -----------------------------
+   Rendering with interpolation for remote players
+   ----------------------------- */
+function lerp(a,b,t){ return a + (b-a)*t; }
 
+function render() {
+  // clear
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // background
+  ctx.fillStyle = '#071226';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // platforms (static, same for client & server)
+  drawPlatforms();
+
+  // draw projectiles (from last snapshot)
+  Object.values(projectiles).forEach(pr => {
+    ctx.fillStyle = '#ffb86b';
+    ctx.beginPath();
+    ctx.arc(pr.x, pr.y, pr.r||6, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // draw players
+  for (let id in players) {
+    let p = players[id];
+
+    // If we have at least two snapshots, interpolate remote players for smoothness
+    if (id !== myId && serverSnapshots.length >= 2) {
+      // find two snapshots around desired render timestamp
+      const nowMs = Date.now();
+      const renderMs = nowMs - 50; // small render delay to smooth jitter
+      let older=null, newer=null;
+      for (let i = serverSnapshots.length-1; i>=0; i--) {
+        const s = serverSnapshots[i];
+        if (s.time <= renderMs) { older = s; newer = serverSnapshots[i+1] || s; break; }
+      }
+      if (!older) { older = serverSnapshots[0]; newer = serverSnapshots[1] || older; }
+      if (older && newer) {
+        const a = (renderMs - older.time) / Math.max(1, (newer.time - older.time));
+        const paOld = older.players.find(x=>x.id===id) || older.players[0] || {};
+        const paNew = newer.players.find(x=>x.id===id) || paOld;
+        const ix = lerp(paOld.x||p.x, paNew.x||p.x, a);
+        const iy = lerp(paOld.y||p.y, paNew.y||p.y, a);
+        p.drawX = ix; p.drawY = iy;
+      } else { p.drawX = p.x; p.drawY = p.y; }
+    } else {
+      // local player or no snapshots -> draw authoritative client state
+      p.drawX = p.x; p.drawY = p.y;
+    }
+
+    // body
+    ctx.fillStyle = id === myId ? '#4ad' : '#fa6';
+    ctx.fillRect(p.drawX, p.drawY, p.w, p.h);
+
+    // face / eye
+    ctx.fillStyle = '#092117';
+    const eyeX = p.drawX + (p.facing>0? p.w-8: 6);
+    ctx.fillRect(eyeX, p.drawY + 12, 6, 6);
+
+    // HP bar
+    ctx.fillStyle = '#222'; ctx.fillRect(p.drawX, p.drawY - 10, p.w, 6);
+    ctx.fillStyle = '#f55'; ctx.fillRect(p.drawX, p.drawY - 10, p.w * Math.max(0, p.hp/100), 6);
+
+    // debug hurtbox
+    ctx.strokeStyle = 'rgba(255,255,0,0.6)'; ctx.strokeRect(p.drawX, p.drawY, p.w, p.h);
+  }
+
+  // HUD
+  ctx.fillStyle = '#ccc';
+  ctx.font = '13px Arial';
+  ctx.fillText(`You: ${myId || '---'}`, 10, 18);
+  ctx.fillText(`LocalTick: ${localTick}`, 140, 18);
+  ctx.fillText(`ServerTick: ${latestServerTick}`, 300, 18);
+}
+
+/* -----------------------------
+   Platforms (static)
+   ----------------------------- */
+const PLATFORMS = [
+  {x: 80, y: 340, w: 220, h: 16},
+  {x: 420, y: 280, w: 180, h: 16},
+  {x: 720, y: 340, w: 220, h: 16},
+];
+
+function drawPlatforms() {
+  ctx.fillStyle = '#2b3350';
+  PLATFORMS.forEach(p => {
+    ctx.fillRect(p.x, p.y, p.w, p.h);
+  });
+}
+
+/* -----------------------------
+   Main loop + scheduling
+   ----------------------------- */
+let lastRender = performance.now();
+function mainLoop() {
+  const now = performance.now();
+  // run multiple client ticks if needed to catch up
+  while (now - lastRender >= CLIENT_DT * 1000) {
+    clientTick();
+    lastRender += CLIENT_DT*1000;
+  }
+  render();
+  requestAnimationFrame(mainLoop);
+}
+requestAnimationFrame(mainLoop);
+
+/* -----------------------------
+   Utility: send ping & request snapshot info
+   ----------------------------- */
+setInterval(()=> {
+  sendInputPacket({type:'ping', ts:Date.now()});
+}, 2000);
+
+/* -----------------------------
+   End of client
+   ----------------------------- */
+</script>
 </body>
 </html>
